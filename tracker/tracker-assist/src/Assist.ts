@@ -1136,7 +1136,14 @@ export default class Assist {
 
     const registerCanvas = (node: Node) => {
       const id = app.nodes.getID(node);
-      if (!id || !hasTag(node, "canvas") || app.sanitizer.isHidden(id)) {
+      // Same exclusions as the Session Replay canvas recorder: a canvas the
+      // app marked hidden or obscured must not be streamed live either.
+      if (
+        !id ||
+        !hasTag(node, "canvas") ||
+        app.sanitizer.isHidden(id) ||
+        app.sanitizer.isObscured(id)
+      ) {
         return;
       }
       const el = node as HTMLCanvasElement;
