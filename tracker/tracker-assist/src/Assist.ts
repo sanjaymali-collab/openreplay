@@ -18,12 +18,17 @@ import type { Options as ConfirmOptions } from "./ConfirmWindow/defaults.js";
 import ScreenRecordingState from "./ScreenRecordingState.js";
 import { pkgVersion } from "./version.js";
 import Canvas from "./Canvas.js";
-import { canvasLiveTrace } from "./canvasLiveDebug.js";
+import { canvasLiveTrace, isCanvasLiveDebug } from "./canvasLiveDebug.js";
+import { findShadowRootCanvases } from "./canvasDiscovery.js";
+import { gzip } from "fflate";
 
 // How long a freshly reported canvas id must stay unchanged before Assist
 // starts streaming it (see registerCanvas).
 const CANVAS_ID_SETTLE_MS = 300;
-import { gzip } from "fflate";
+// Shadow-root canvases can be bound by the tracker after Assist's own scan;
+// re-check this often, this many times, after every (re)start.
+const SHADOW_SCAN_INTERVAL_MS = 500;
+const SHADOW_SCAN_MAX_ATTEMPTS = 20;
 
 const SS_CONFIRM_KEY = "__or_session_confirm";
 
@@ -1131,40 +1136,11 @@ export default class Assist {
 
     const registerCanvas = (node: Node) => {
       const id = app.nodes.getID(node);
-      try {
-        const w = window as Window & {
-          __OR_CANVAS_LAST_SEEN__?: Record<string, unknown>;
-          __OR_CANVAS_LAST_ID__?: number;
-          __OR_CANVAS_MAP_SIZE__?: number;
-        };
-        w.__OR_CANVAS_LAST_SEEN__ = {
-          id: id ?? null,
-          tag: (node as Element).tagName || null,
-          hidden: id ? app.sanitizer.isHidden(id) : null,
-          mapped: id ? this.canvasMap.has(id) : false,
-        };
-        if (id) {
-          w.__OR_CANVAS_LAST_ID__ = id;
-          w.__OR_CANVAS_MAP_SIZE__ = this.canvasMap.size;
-        }
-      } catch {
-        /* ignore */
-      }
       if (!id || !hasTag(node, "canvas") || app.sanitizer.isHidden(id)) {
         return;
       }
       const el = node as HTMLCanvasElement;
-      if (el.id === "flutter-mirror-canvas" || el.id === "canvas-or-testing") {
-        return;
-      }
-      try {
-        const style = el.ownerDocument.defaultView?.getComputedStyle(el);
-        if (style && parseFloat(style.left) < -5000) {
-          return;
-        }
-      } catch {
-        /* ignore */
-      }
+      // A 0×0 canvas never produces captureStream frames, even after resize.
       if (el.width < 2 || el.height < 2) {
         return;
       }
@@ -1172,12 +1148,9 @@ export default class Assist {
         return;
       }
       // Capture only while someone is watching: a WebGL proxy copies a full
-      // frame per rAF, and NEW_AGENT restarts tracking and rescans canvases
-      // anyway. (__OR_CANVAS_DEBUG__ keeps eager capture for diagnostics.)
-      const debugEager = Boolean(
-        (window as Window & { __OR_CANVAS_DEBUG__?: boolean }).__OR_CANVAS_DEBUG__,
-      );
-      if (Object.keys(this.agents).length === 0 && !debugEager) {
+      // frame per tick, and NEW_AGENT restarts tracking and rescans canvases
+      // anyway. (Debug mode keeps eager capture for diagnostics.)
+      if (Object.keys(this.agents).length === 0 && !isCanvasLiveDebug()) {
         canvasLiveTrace("CANVAS_DEFERRED", { canvasId: id });
         return;
       }
@@ -1195,31 +1168,19 @@ export default class Assist {
           id,
           30,
           (stream: MediaStream) => {
-            try {
-              const w = window as Window & { __OR_CANVAS_STREAMS__?: unknown[] };
-              w.__OR_CANVAS_STREAMS__ = w.__OR_CANVAS_STREAMS__ || [];
-              w.__OR_CANVAS_STREAMS__.push({
-                id,
-                w: el.width,
-                h: el.height,
-                tracks: stream.getTracks().length,
-                source: canvasHandler.captureSource,
-                context: canvasHandler.captureContext,
-              });
-            } catch {
-              /* ignore */
-            }
+            canvasLiveTrace("STREAM_CREATED", {
+              canvasId: id,
+              width: el.width,
+              height: el.height,
+              tracks: stream.getTracks().length,
+              source: canvasHandler.captureSource,
+              context: canvasHandler.captureContext,
+            });
             startCanvasStream(stream, id);
           },
           app.debug.error,
         );
         this.canvasMap.set(id, canvasHandler);
-        try {
-          (window as Window & { __OR_CANVAS_MAP_SIZE__?: number }).__OR_CANVAS_MAP_SIZE__ =
-            this.canvasMap.size;
-        } catch {
-          /* ignore */
-        }
         if (this.canvasNodeCheckers.has(id)) {
           clearInterval(this.canvasNodeCheckers.get(id));
         }
@@ -1252,34 +1213,29 @@ export default class Assist {
       this.canvasSettleTimers.set(id, settle);
     };
 
-    // Flutter CanvasKit (and similar) paints into a <canvas> inside an open
-    // shadow root. The tracker binds shadow trees itself (top_observer node
-    // callback), but scanTree() does not descend into them and the bind can
-    // land after our scan, so poll the known framework hosts for a while.
-    const FRAMEWORK_CANVAS_HOSTS = ["flt-glass-pane", "flt-renderer", "flutter-view"];
-    let frameworkScanAttempts = 0;
-    const discoverFrameworkCanvases = () => {
+    // Canvas renderers such as Flutter CanvasKit, Unity and some charting
+    // libraries paint into a <canvas> inside an open shadow root. The tracker
+    // binds shadow trees itself (top_observer node callback), but scanTree()
+    // does not descend into them and the bind can land after our scan, so
+    // re-check the shadow roots for a while after (re)start.
+    let shadowScanAttempts = 0;
+    let shadowScanTimer: number | null = null;
+    const discoverShadowRootCanvases = () => {
       if (typeof document === "undefined") return;
-      let hostCount = 0;
+      shadowScanTimer = null;
       let found = 0;
-      FRAMEWORK_CANVAS_HOSTS.forEach((sel) => {
-        document.querySelectorAll(sel).forEach((host) => {
-          hostCount += 1;
-          const root: ParentNode = (host as Element).shadowRoot ?? host;
-          root.querySelectorAll("canvas").forEach((canvas) => {
-            // Never assign ids here: the observer owns node ids and clears
-            // them on (re)start, which would leave a stale capture behind.
-            // Only pick up canvases the tracker has already bound; the retry
-            // below covers the window until it binds the shadow tree.
-            if (app.nodes.getID(canvas) === undefined) return;
-            registerCanvas(canvas);
-            found += 1;
-          });
-        });
+      findShadowRootCanvases(document).forEach((canvas) => {
+        // Never assign ids here: the observer owns node ids and clears them
+        // on (re)start, which would leave a stale capture behind. Only pick up
+        // canvases the tracker has already bound; the retry below covers the
+        // window until it binds the shadow tree.
+        if (app.nodes.getID(canvas) === undefined) return;
+        registerCanvas(canvas);
+        found += 1;
       });
-      if (found === 0 && hostCount > 0 && frameworkScanAttempts < 20) {
-        frameworkScanAttempts += 1;
-        setTimeout(discoverFrameworkCanvases, 500);
+      if (found === 0 && shadowScanAttempts < SHADOW_SCAN_MAX_ATTEMPTS) {
+        shadowScanAttempts += 1;
+        shadowScanTimer = window.setTimeout(discoverShadowRootCanvases, SHADOW_SCAN_INTERVAL_MS);
       }
     };
 
@@ -1287,9 +1243,13 @@ export default class Assist {
     // Canvases already in the node map (Shadow DOM / late plugin attach)
     // never fire attachNodeCallback. Replay already scanTree()s them.
     this.rescanCanvases = () => {
-      frameworkScanAttempts = 0;
+      shadowScanAttempts = 0;
+      if (shadowScanTimer !== null) {
+        clearTimeout(shadowScanTimer);
+        shadowScanTimer = null;
+      }
       app.nodes.scanTree(registerCanvas);
-      discoverFrameworkCanvases();
+      discoverShadowRootCanvases();
     };
     this.rescanCanvases();
   }
@@ -1312,11 +1272,6 @@ export default class Assist {
     this.canvasSettleTimers.forEach((t) => clearTimeout(t));
     this.canvasSettleTimers.clear();
     this.cleanCanvasConnections();
-    try {
-      (window as Window & { __OR_CANVAS_MAP_SIZE__?: number }).__OR_CANVAS_MAP_SIZE__ = 0;
-    } catch {
-      /* ignore */
-    }
   }
 
   private setupPeerListeners(id: string) {

@@ -131,13 +131,6 @@ export default class ConfirmWindow {
 
   mount(): Promise<boolean> {
     document.body.appendChild(this.wrapper)
-    try {
-      document.querySelectorAll('flt-glass-pane, flutter-view, #flutter-container').forEach((n) => {
-        (n as HTMLElement).style.setProperty('pointer-events', 'none', 'important')
-      })
-    } catch {
-      /* ignore */
-    }
 
     return new Promise((resolve, reject) => {
       this.resolve = resolve

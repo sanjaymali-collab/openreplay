@@ -267,3 +267,70 @@ describe('CanvasReceiver CSS-paint pre-decode', () => {
     expect(canvas.style.backgroundImage).toContain(createdBlobs[0]);
   });
 });
+
+/**
+ * Regression: the WebRTC track and the DOM message creating the <canvas> node
+ * travel on different channels. With a single fixed 250ms lookup the receiver
+ * gave up (or, in an interim build, painted a floating overlay) whenever the
+ * node landed a little later — which is the normal case for a canvas the
+ * tracker binds inside a shadow root after a restart. The receiver must keep
+ * looking for a bounded time, and must stop looking when the stream is gone.
+ */
+describe('CanvasReceiver attaches when the canvas node arrives after the track', () => {
+  function receiverWithLateNode(useCssPaint = false) {
+    const canvas = realCreateElement('canvas');
+    canvas.width = 640;
+    canvas.height = 360;
+    document.body.appendChild(canvas);
+    let node: any;
+    const getNode = jest.fn(() => node) as any;
+    const socket = fakeSocket();
+    const receiver = new CanvasReceiver('peer', [], getNode, { id: 'agent-1' }, socket as any, useCssPaint);
+    const stream = { getTracks: () => [{}], getVideoTracks: () => [{}] } as unknown as MediaStream;
+    const peerId = 'peer-agent-1-canvas-7';
+    (receiver as any).connections.set(peerId, { connectionState: 'connected', close: jest.fn() });
+    (receiver as any).streams.set('7', stream);
+    jest.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(() => Promise.resolve());
+    return { receiver, canvas, getNode, socket, stream, peerId, setNode: () => { node = { node: canvas }; } };
+  }
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('retries the node lookup and attaches once the node exists', () => {
+    const { receiver, getNode, stream, peerId, setNode } = receiverWithLateNode();
+    (receiver as any).attachWhenNodeArrives('7', stream, peerId);
+    jest.advanceTimersByTime(250 * 3);
+    expect(getNode).toHaveBeenCalledTimes(3);
+    expect((receiver as any).canvasesData.size).toBe(0);
+    setNode();
+    jest.advanceTimersByTime(250);
+    expect((receiver as any).canvasesData.size).toBe(1);
+    expect((receiver as any).canvasesData.get('7').video.srcObject).toBe(stream);
+  });
+
+  it('gives up after the bounded number of attempts and never paints outside the replayed canvas', () => {
+    const { receiver, getNode, stream, peerId } = receiverWithLateNode();
+    (receiver as any).attachWhenNodeArrives('7', stream, peerId);
+    jest.advanceTimersByTime(250 * 50);
+    expect(getNode).toHaveBeenCalledTimes(20);
+    expect((receiver as any).canvasesData.size).toBe(0);
+    // No fallback <video> is injected anywhere in the agent document.
+    expect(document.querySelectorAll('video')).toHaveLength(0);
+  });
+
+  it('stops looking when the member stops the canvas stream', () => {
+    const { receiver, getNode, socket, stream, peerId, setNode } = receiverWithLateNode();
+    (receiver as any).attachWhenNodeArrives('7', stream, peerId);
+    jest.advanceTimersByTime(250);
+    socket.fire('webrtc_canvas_stop', { id: peerId });
+    setNode();
+    jest.advanceTimersByTime(250 * 30);
+    expect(getNode).toHaveBeenCalledTimes(1);
+    expect((receiver as any).canvasesData.size).toBe(0);
+  });
+});

@@ -1,5 +1,4 @@
 import logger from '@/logger';
-import { VElement } from 'Player/web/managers/DOM/VirtualDOM';
 import MessageManager from 'Player/web/MessageManager';
 import { Socket } from 'socket.io-client';
 import { toast } from 'react-toastify';
@@ -12,6 +11,10 @@ import {
  * lossy video frames, never leaves the agent's machine. */
 const CSS_FRAME_MIME = 'image/webp';
 const CSS_FRAME_QUALITY = 0.8;
+
+/** How long to wait for the replayed <canvas> node after its track arrives. */
+const NODE_LOOKUP_INTERVAL_MS = 250;
+const NODE_LOOKUP_ATTEMPTS = 20;
 
 interface LiveCanvasData {
   video: HTMLVideoElement;
@@ -41,8 +44,8 @@ export default class CanvasReceiver {
 
   private frameCounter = 0;
 
-  // canvasId -> disposer for a fallback overlay <video> (see overlayLiveVideo)
-  private overlays: Map<string, () => void> = new Map();
+  /** True while the rAF draw loop is scheduled (it exits when nothing is left). */
+  private drawing = false;
 
   private canvasesData = new Map<string, LiveCanvasData>();
 
@@ -89,10 +92,8 @@ export default class CanvasReceiver {
       const canvasId = getCanvasId(id);
       this.connections.get(id)?.close();
       this.connections.delete(id);
-      this.streams.delete(id);
+      this.streams.delete(canvasId);
       this.disposeCanvasData(canvasId);
-      this.overlays.get(canvasId)?.();
-      this.overlays.delete(canvasId);
     });
 
     this.socket.on('webrtc_canvas_restart', () => {
@@ -134,34 +135,7 @@ export default class CanvasReceiver {
           canvasId,
           tracks: stream.getTracks().length,
         });
-        setTimeout(() => {
-          const node = this.getNode(parseInt(canvasId, 10));
-          const videoEl = spawnVideo(
-            stream,
-            node as VElement,
-          );
-          const target = resolvePaintTarget(node);
-          if (target && videoEl) {
-            this.disposeCanvasData(canvasId);
-            this.canvasesData.set(canvasId, {
-              video: videoEl,
-              canvas: target.canvas,
-              canvasCtx: target.ctx,
-              encoding: false,
-              blobUrl: '',
-            });
-            canvasAgentTrace('FRAME_RECEIVED', {
-              canvasId,
-              cssPaint: this.useCssPaint ? 1 : 0,
-            });
-            this.draw();
-          } else {
-            logger.log('NODE', canvasId, 'IS NOT FOUND — overlaying live canvas video');
-            this.overlays.get(canvasId)?.();
-            this.overlays.set(canvasId, overlayLiveVideo(videoEl, canvasId));
-            canvasAgentTrace('FRAME_RECEIVED', { canvasId, overlay: 1 });
-          }
-        }, 250);
+        this.attachWhenNodeArrives(canvasId, stream, id);
       }
     };
 
@@ -188,6 +162,49 @@ export default class CanvasReceiver {
     this.socket.emit('webrtc_canvas_answer', { answer: pc.localDescription, id });
   }
 
+  /**
+   * The WebRTC track and the DOM message that creates the <canvas> node travel
+   * on different channels, so the node may land shortly after the track. Poll
+   * for it (bounded) instead of giving up after a single fixed delay.
+   */
+  private attachWhenNodeArrives(
+    canvasId: string,
+    stream: MediaStream,
+    peerId: string,
+    attempt = 0,
+  ) {
+    window.setTimeout(() => {
+      // Stopped or superseded while waiting.
+      if (this.connections.get(peerId)?.connectionState === 'closed') return;
+      if (this.streams.get(canvasId) !== stream) return;
+      const node = this.getNode(parseInt(canvasId, 10));
+      const target = resolvePaintTarget(node);
+      if (!target) {
+        if (attempt + 1 < NODE_LOOKUP_ATTEMPTS) {
+          this.attachWhenNodeArrives(canvasId, stream, peerId, attempt + 1);
+        } else {
+          logger.log('NODE', canvasId, 'IS NOT FOUND');
+        }
+        return;
+      }
+      const videoEl = spawnVideo(stream);
+      this.disposeCanvasData(canvasId);
+      this.canvasesData.set(canvasId, {
+        video: videoEl,
+        canvas: target.canvas,
+        canvasCtx: target.ctx,
+        encoding: false,
+        blobUrl: '',
+      });
+      canvasAgentTrace('FRAME_RECEIVED', {
+        canvasId,
+        cssPaint: this.useCssPaint ? 1 : 0,
+        attempt,
+      });
+      this.startDrawLoop();
+    }, NODE_LOOKUP_INTERVAL_MS);
+  }
+
   async handleCandidate(
     candidate: RTCIceCandidateInit,
     id: string,
@@ -211,8 +228,6 @@ export default class CanvasReceiver {
     Array.from(this.canvasesData.keys()).forEach((id) =>
       this.disposeCanvasData(id),
     );
-    this.overlays.forEach((dispose) => dispose());
-    this.overlays.clear();
   }
 
   /**
@@ -315,41 +330,50 @@ export default class CanvasReceiver {
     );
   }
 
+  /** Start the rAF paint loop unless one is already running. */
+  private startDrawLoop() {
+    if (this.drawing) return;
+    this.drawing = true;
+    this.frameCounter = 0;
+    this.draw();
+  }
+
+  /** One paint tick (every 4th frame); reschedules itself while there is a canvas to paint. */
   draw = () => {
     if (this.frameCounter % 4 === 0) {
       if (this.canvasesData.size === 0) {
+        this.drawing = false;
         return;
       }
       this.canvasesData.forEach((canvasData, id) => {
         const { video, canvas, canvasCtx } = canvasData;
         const node = this.getNode(parseInt(id, 10));
-        if (node) {
-          if (video.paused) {
-            void video.play().catch(() => {});
-          }
-          if (this.useCssPaint) {
-            this.paintCssFrame(id, canvasData);
-          } else {
-            canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            if (video.videoWidth > 0) this.paintedFrames += 1;
-            if (!this.tracedRendered.has(id) && video.videoWidth > 0) {
-              this.tracedRendered.add(id);
-              canvasAgentTrace('FRAME_RENDERED', { canvasId: id, cssPaint: 0 });
-            }
-          }
-          publishAgentLive({
-            canvasId: id,
-            videoW: video.videoWidth,
-            videoH: video.videoHeight,
-            frames: this.paintedFrames,
-            ready: video.readyState,
-            overlay: false,
-            cssPaint: this.useCssPaint,
-            inDom: canvas.isConnected,
-          });
-        } else {
+        if (!node) {
           this.disposeCanvasData(id);
+          return;
         }
+        if (video.paused) {
+          void video.play().catch(() => {});
+        }
+        if (this.useCssPaint) {
+          this.paintCssFrame(id, canvasData);
+        } else {
+          canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          if (video.videoWidth > 0) this.paintedFrames += 1;
+          if (!this.tracedRendered.has(id) && video.videoWidth > 0) {
+            this.tracedRendered.add(id);
+            canvasAgentTrace('FRAME_RENDERED', { canvasId: id, cssPaint: 0 });
+          }
+        }
+        publishAgentLive({
+          canvasId: id,
+          videoW: video.videoWidth,
+          videoH: video.videoHeight,
+          frames: this.paintedFrames,
+          ready: video.readyState,
+          cssPaint: this.useCssPaint,
+          inDom: canvas.isConnected,
+        });
       });
     }
     this.frameCounter++;
@@ -357,13 +381,28 @@ export default class CanvasReceiver {
   };
 }
 
-/** Debug-only window global consumed by the live-canvas QA harness. */
+/**
+ * Debug-only (window.__OR_CANVAS_DEBUG__) window global with the live render
+ * state, read by the live-canvas QA harness. No-op otherwise.
+ */
 function publishAgentLive(state: Record<string, unknown>): void {
+  if (!isCanvasDebug()) return;
   try {
     (window as Window & { __OR_AGENT_LIVE__?: Record<string, unknown> }).__OR_AGENT_LIVE__ =
       state;
   } catch {
     /* ignore */
+  }
+}
+
+function isCanvasDebug(): boolean {
+  try {
+    return (
+      typeof window !== 'undefined' &&
+      Boolean((window as Window & { __OR_CANVAS_DEBUG__?: boolean }).__OR_CANVAS_DEBUG__)
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -382,76 +421,7 @@ function resolvePaintTarget(node: { node: Node } | undefined): {
   return null;
 }
 
-function overlayLiveVideo(
-  videoEl: HTMLVideoElement | undefined,
-  canvasId: string,
-): () => void {
-  if (!videoEl || typeof document === 'undefined') return () => {};
-  const wrapId = 'or-live-canvas-wrap';
-  let wrap = document.getElementById(wrapId);
-  if (!wrap) {
-    wrap = document.createElement('div');
-    wrap.id = wrapId;
-    wrap.style.cssText =
-      'position:fixed;z-index:2147483646;overflow:hidden;pointer-events:auto;background:transparent;';
-    document.body.appendChild(wrap);
-  }
-  videoEl.id = `or-live-video-${canvasId}`;
-  videoEl.muted = true;
-  videoEl.autoplay = true;
-  videoEl.playsInline = true;
-  videoEl.setAttribute('autoplay', 'true');
-  videoEl.setAttribute('muted', 'true');
-  videoEl.setAttribute('playsinline', 'true');
-  videoEl.style.cssText =
-    'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:transparent;display:block;';
-  if (!wrap.contains(videoEl)) wrap.appendChild(videoEl);
-  const tryPlay = () => {
-    void videoEl.play().catch(() => {});
-  };
-  tryPlay();
-  wrap.addEventListener('click', tryPlay);
-  const place = () => {
-    const iframes = Array.from(document.querySelectorAll('iframe'));
-    iframes.sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight);
-    const target = iframes[0] || document.querySelector('[class*=player]');
-    if (!target) return;
-    const r = target.getBoundingClientRect();
-    wrap.style.left = `${r.left}px`;
-    wrap.style.top = `${r.top}px`;
-    wrap.style.width = `${r.width}px`;
-    wrap.style.height = `${r.height}px`;
-  };
-  place();
-  let frames = 0;
-  let stopped = false;
-  const tick = () => {
-    if (stopped) return;
-    place();
-    tryPlay();
-    if (videoEl.videoWidth > 0) frames += 1;
-    publishAgentLive({
-      canvasId,
-      videoW: videoEl.videoWidth,
-      videoH: videoEl.videoHeight,
-      frames,
-      ready: videoEl.readyState,
-      overlay: true,
-      inDom: document.body.contains(videoEl),
-    });
-    requestAnimationFrame(tick);
-  };
-  tick();
-  return () => {
-    stopped = true;
-    wrap?.removeEventListener('click', tryPlay);
-    videoEl.srcObject = null;
-    videoEl.remove();
-    if (wrap && !wrap.querySelector('video')) wrap.remove();
-  };
-}
-
-function spawnVideo(stream: MediaStream, node: VElement) {
+function spawnVideo(stream: MediaStream) {
   const videoEl = document.createElement('video');
 
   videoEl.srcObject = stream;
@@ -502,15 +472,15 @@ function spawnVideo(stream: MediaStream, node: VElement) {
   return videoEl;
 }
 
+/** Debug-only (window.__OR_CANVAS_DEBUG__) pipeline trace; never logs pixels. */
 function canvasAgentTrace(
   stage: 'TRACK_RECEIVED' | 'FRAME_RECEIVED' | 'FRAME_RENDERED',
   detail: Record<string, string | number>,
 ): void {
+  if (!isCanvasDebug()) return;
   try {
-    if (typeof window !== 'undefined' && (window as any).__OR_CANVAS_DEBUG__) {
-      // eslint-disable-next-line no-console
-      console.debug('[openreplay-canvas]', stage, detail);
-    }
+    // eslint-disable-next-line no-console
+    console.debug('[openreplay-canvas]', stage, detail);
   } catch {
     /* ignore */
   }

@@ -100,6 +100,35 @@ describe('CanvasRecorder', () => {
       expect(appMock.send).toHaveBeenCalled()
       jest.useRealTimers()
     })
+
+    // Regression: a canvas inside an open shadow root (Flutter CanvasKit, web
+    // components) is connected to the document but document.contains() is
+    // false for it. The recorder used to treat that as "removed" on the first
+    // tick and stop, so shadow-DOM canvases never produced replay snapshots.
+    test('keeps recording a canvas that lives inside a shadow root', () => {
+      jest.useFakeTimers()
+      const host = document.createElement('div')
+      document.body.appendChild(host)
+      const shadowCanvas = host.attachShadow({ mode: 'open' }).appendChild(document.createElement('canvas'))
+      expect(document.contains(shadowCanvas)).toBe(false)
+      expect(shadowCanvas.isConnected).toBe(true)
+
+      canvasRecorder.recordCanvas(shadowCanvas, 7)
+      jest.advanceTimersByTime((1000 / 30) * 3)
+      expect(canvasRecorder['snapshots'][7]).toBeDefined()
+      expect(canvasRecorder['intervals'].has(7)).toBe(true)
+      expect(appMock.debug.log).not.toHaveBeenCalledWith(
+        'Canvas element not in sync',
+        expect.anything(),
+        expect.anything(),
+      )
+
+      // Detaching the shadow host is a real removal and must still stop it.
+      host.remove()
+      jest.advanceTimersByTime(1000 / 30)
+      expect(canvasRecorder['intervals'].has(7)).toBe(false)
+      jest.useRealTimers()
+    })
   })
 
   describe('clear', () => {

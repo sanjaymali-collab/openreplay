@@ -1235,14 +1235,21 @@ export default class App {
 
   private checkSessionToken(forceNew?: boolean) {
     const PROTO_VERSION = "2";
+    const versionKey = `${this.options.session_token_key}_version`
     const needReset = this.sessionStorage.getItem(this.options.session_reset_key) !== null
     let needNewSessionID = forceNew || needReset
     const sessionToken = this.session.getSessionToken(this.projectKey)
     if (sessionToken) {
-      const storedVersion = this.sessionStorage.getItem(`${this.options.session_token_key}_version`)
-      needNewSessionID = !storedVersion || storedVersion !== PROTO_VERSION
-      this.sessionStorage.setItem(`${this.options.session_token_key}_version`, PROTO_VERSION)
+      // A token written under a different protocol version cannot be resumed.
+      const storedVersion = this.sessionStorage.getItem(versionKey)
+      needNewSessionID = needNewSessionID || !storedVersion || storedVersion !== PROTO_VERSION
     }
+    // Stamp the version on every check, including the very first start (no
+    // token yet). Previously the stamp was only written when a token already
+    // existed, so the first stop()/start() of a session always saw a token
+    // without a version stamp, dropped it, and forked a new session id; any
+    // Assist/live-view agent attached to the original id was then orphaned.
+    this.sessionStorage.setItem(versionKey, PROTO_VERSION)
     return needNewSessionID || !sessionToken
   }
 

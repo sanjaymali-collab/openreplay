@@ -175,7 +175,11 @@ class CanvasRecorder {
         return
       }
 
-      if (!document.contains(cachedCanvas)) {
+      // isConnected, not document.contains(): a canvas inside a shadow root
+      // (Flutter CanvasKit, Unity, web components) is connected but is never
+      // "contained" by the document, so the old check tore it down after the
+      // first tick and the replay stayed blank.
+      if (!cachedCanvas.isConnected) {
         this.app.debug.log('Canvas element not in sync', cachedCanvas, node)
         this.cleanupCanvas(id)
         return

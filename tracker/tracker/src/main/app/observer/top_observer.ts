@@ -5,7 +5,7 @@ import IFrameObserver from './iframe_observer.js'
 import ShadowRootObserver from './shadow_root_observer.js'
 import IFrameOffsets, { Offset } from './iframe_offsets.js'
 
-import { CreateDocument } from '../messages.gen.js'
+import { CreateDocument, SetNodeAttribute } from '../messages.gen.js'
 import App from '../index.js'
 import { IN_BROWSER, hasOpenreplayAttribute, canAccessIframe } from '../../utils.js'
 
@@ -241,8 +241,6 @@ export default class TopObserver extends Observer {
       },
       window.document.documentElement,
     )
-<<<<<<< HEAD
-=======
 
     // Send before `orloaded` so it lands in the initial visual batch (see sendColorScheme).
     this.sendColorScheme()
@@ -278,7 +276,6 @@ export default class TopObserver extends Observer {
       used = declared.includes('dark') && (prefersDark || !declared.includes('light')) ? 'dark' : 'light'
     }
     this.app.send(SetNodeAttribute(0, '__openreplay_color_scheme', used))
->>>>>>> 157b3322e (support native dialog api (#4799))
   }
 
   crossdomainObserve(rootNodeId: number, frameOder: number, frameLevel: number) {
