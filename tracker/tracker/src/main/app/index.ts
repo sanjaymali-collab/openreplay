@@ -19,6 +19,7 @@ import {
   simpleMerge,
 } from '../utils.js'
 import CanvasRecorder from './canvas.js'
+import { installPreserveDrawingBuffer } from './preserveDrawingBuffer.js'
 import Logger, { ILogLevel, LogLevel } from './logger.js'
 import Message, {
   Metadata,
@@ -140,6 +141,13 @@ type AppOptions = {
   assistSocketHost?: string
   canvas: {
     disableCanvas?: boolean
+    /**
+     * Default-on. Patches getContext('webgl'|'webgl2') so the drawing
+     * buffer is readable by captureStream / drawImage. Required for live
+     * Assist of WebGL canvases (CanvasKit, Three.js, etc.). Set false to
+     * leave application context attributes unchanged.
+     */
+    preserveDrawingBuffer?: boolean
     /**
      * If you expect HI-DPI users mostly, this will render canvas
      * in 1:1 pixel ratio
@@ -315,6 +323,7 @@ export default class App {
       },
       canvas: {
         disableCanvas: false,
+        preserveDrawingBuffer: true,
         fixedCanvasScaling: false,
         __save_canvas_locally: false,
         useAnimationFrame: false,
@@ -325,6 +334,14 @@ export default class App {
       disableThrottling: false,
     }
     this.options = simpleMerge(defaultOptions, options)
+
+    if (
+      IN_BROWSER &&
+      this.options.canvas.preserveDrawingBuffer !== false &&
+      !this.options.canvas.disableCanvas
+    ) {
+      installPreserveDrawingBuffer()
+    }
 
     if (
       !this.insideIframe &&

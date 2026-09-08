@@ -3,6 +3,7 @@ import parseFrames, { FrameSnapshot } from 'Player/common/parseFrames';
 import unpackTar from 'Player/common/tarball';
 import unpack from 'Player/common/unpack';
 import { VElement } from 'Player/web/managers/DOM/VirtualDOM';
+import { paintCanvasCssFrame } from 'Player/web/managers/canvasCssPaint';
 import { TarFile } from 'js-untar';
 
 const playMode = {
@@ -305,15 +306,7 @@ export default class CanvasManager extends ListWalker<Timestamp> {
       }
       return;
     }
-    Object.assign(canvasEl.style, {
-      backgroundImage: `url("${blobUrl}")`,
-      backgroundSize: '100% 100%',
-      backgroundRepeat: 'no-repeat',
-      // The bitmap is painted into the content box, so anchor the background
-      // there too — otherwise a padded canvas would be offset against it.
-      backgroundOrigin: 'content-box',
-      backgroundClip: 'content-box',
-    });
+    paintCanvasCssFrame(canvasEl, blobUrl);
   };
 
   /** Take ownership of the displayed frame and release the one it replaced. */

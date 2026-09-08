@@ -3,6 +3,34 @@ import { VElement } from 'Player/web/managers/DOM/VirtualDOM';
 import MessageManager from 'Player/web/MessageManager';
 import { Socket } from 'socket.io-client';
 import { toast } from 'react-toastify';
+import {
+  clearCanvasCssFrame,
+  paintCanvasCssFrame,
+} from 'Player/web/managers/canvasCssPaint';
+
+/** Encode quality for the CSS-paint path: a second lossy pass over already-
+ * lossy video frames, never leaves the agent's machine. */
+const CSS_FRAME_MIME = 'image/webp';
+const CSS_FRAME_QUALITY = 0.8;
+
+interface LiveCanvasData {
+  video: HTMLVideoElement;
+  canvas: HTMLCanvasElement;
+  canvasCtx: CanvasRenderingContext2D;
+  /**
+   * CSS-paint path only: a private 2d canvas living in the *agent* document
+   * (where scripting is enabled) that the decoded video frame is drawn into and
+   * encoded from. The replayed canvas cannot be encoded — under the sandbox
+   * its bitmap is never painted, and we do not draw into it at all.
+   */
+  staging?: HTMLCanvasElement;
+  stagingCtx?: CanvasRenderingContext2D | null;
+  /** One toBlob in flight per canvas: drop frames rather than queue them. */
+  encoding: boolean;
+  /** Blob URL currently displayed, revoked when the next frame replaces it. */
+  blobUrl: string;
+}
+
 export default class CanvasReceiver {
   private streams: Map<string, MediaStream> = new Map();
 
@@ -12,14 +40,11 @@ export default class CanvasReceiver {
   private cId: string;
 
   private frameCounter = 0;
-  private canvasesData = new Map<
-    string,
-    {
-      video: HTMLVideoElement;
-      canvas: HTMLCanvasElement;
-      canvasCtx: CanvasRenderingContext2D;
-    }
-  >(new Map());
+
+  // canvasId -> disposer for a fallback overlay <video> (see overlayLiveVideo)
+  private overlays: Map<string, () => void> = new Map();
+
+  private canvasesData = new Map<string, LiveCanvasData>();
 
   // sendSignal – for sending signals (offer/answer/ICE)
   constructor(
@@ -28,6 +53,13 @@ export default class CanvasReceiver {
     private readonly getNode: MessageManager['getNode'],
     private readonly agentInfo: Record<string, any>,
     private readonly socket: Socket,
+    /**
+     * The player document has scripting disabled (sandbox without
+     * allow-scripts), so drawImage() into the replayed canvas is never shown.
+     * Frames are then painted as the canvas element's CSS background instead
+     * — the same mechanism CanvasManager uses for Session Replay.
+     */
+    private readonly useCssPaint: boolean = false,
   ) {
     // Form an id like in PeerJS
     this.cId = `${this.peerIdPrefix}-${this.agentInfo.id}-canvas`;
@@ -55,9 +87,12 @@ export default class CanvasReceiver {
     this.socket.on('webrtc_canvas_stop', (data: { id: string }) => {
       const { id } = data;
       const canvasId = getCanvasId(id);
+      this.connections.get(id)?.close();
       this.connections.delete(id);
       this.streams.delete(id);
-      this.canvasesData.delete(canvasId);
+      this.disposeCanvasData(canvasId);
+      this.overlays.get(canvasId)?.();
+      this.overlays.delete(canvasId);
     });
 
     this.socket.on('webrtc_canvas_restart', () => {
@@ -78,8 +113,12 @@ export default class CanvasReceiver {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        const candidate =
+          typeof event.candidate.toJSON === 'function'
+            ? event.candidate.toJSON()
+            : event.candidate;
         this.socket.emit('webrtc_canvas_ice_candidate', {
-          candidate: event.candidate,
+          candidate,
           id,
         });
       }
@@ -91,23 +130,36 @@ export default class CanvasReceiver {
         // Detect canvasId from remote peer id
         const canvasId = getCanvasId(id);
         this.streams.set(canvasId, stream);
+        canvasAgentTrace('TRACK_RECEIVED', {
+          canvasId,
+          tracks: stream.getTracks().length,
+        });
         setTimeout(() => {
           const node = this.getNode(parseInt(canvasId, 10));
           const videoEl = spawnVideo(
-            stream.clone() as MediaStream,
+            stream,
             node as VElement,
           );
-          if (node && videoEl) {
+          const target = resolvePaintTarget(node);
+          if (target && videoEl) {
+            this.disposeCanvasData(canvasId);
             this.canvasesData.set(canvasId, {
               video: videoEl,
-              canvas: node.node as HTMLCanvasElement,
-              canvasCtx: (node.node as HTMLCanvasElement)?.getContext(
-                '2d',
-              ) as CanvasRenderingContext2D,
+              canvas: target.canvas,
+              canvasCtx: target.ctx,
+              encoding: false,
+              blobUrl: '',
+            });
+            canvasAgentTrace('FRAME_RECEIVED', {
+              canvasId,
+              cssPaint: this.useCssPaint ? 1 : 0,
             });
             this.draw();
           } else {
-            logger.log('NODE', canvasId, 'IS NOT FOUND');
+            logger.log('NODE', canvasId, 'IS NOT FOUND — overlaying live canvas video');
+            this.overlays.get(canvasId)?.();
+            this.overlays.set(canvasId, overlayLiveVideo(videoEl, canvasId));
+            canvasAgentTrace('FRAME_RECEIVED', { canvasId, overlay: 1 });
           }
         }, 250);
       }
@@ -117,8 +169,23 @@ export default class CanvasReceiver {
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    await new Promise<void>((resolve) => {
+      if (pc.iceGatheringState === 'complete') {
+        resolve();
+        return;
+      }
+      const done = () => {
+        pc.removeEventListener('icegatheringstatechange', onChange);
+        resolve();
+      };
+      const onChange = () => {
+        if (pc.iceGatheringState === 'complete') done();
+      };
+      pc.addEventListener('icegatheringstatechange', onChange);
+      window.setTimeout(done, 2500);
+    });
 
-    this.socket.emit('webrtc_canvas_answer', { answer, id });
+    this.socket.emit('webrtc_canvas_answer', { answer: pc.localDescription, id });
   }
 
   async handleCandidate(
@@ -141,7 +208,111 @@ export default class CanvasReceiver {
     });
     this.connections.clear();
     this.streams.clear();
-    this.canvasesData.clear();
+    Array.from(this.canvasesData.keys()).forEach((id) =>
+      this.disposeCanvasData(id),
+    );
+    this.overlays.forEach((dispose) => dispose());
+    this.overlays.clear();
+  }
+
+  /**
+   * Stop painting one canvas and release everything it holds: the displayed
+   * blob URL, the staging canvas, and the CSS frame left on the replayed
+   * element (so an ended stream never lingers as a frozen picture).
+   */
+  private disposeCanvasData(canvasId: string) {
+    const data = this.canvasesData.get(canvasId);
+    if (!data) return;
+    this.canvasesData.delete(canvasId);
+    if (data.blobUrl) {
+      URL.revokeObjectURL(data.blobUrl);
+      data.blobUrl = '';
+    }
+    if (data.staging) {
+      data.staging.width = 0;
+      data.staging.height = 0;
+      data.staging = undefined;
+      data.stagingCtx = undefined;
+    }
+    if (this.useCssPaint) {
+      clearCanvasCssFrame(data.canvas);
+    }
+  }
+
+  private paintedFrames = 0;
+
+  private tracedRendered = new Set<string>();
+
+  /**
+   * CSS-paint path (see constructor). Copy the decoded video frame into the
+   * agent-side staging canvas, encode it, and set it as the replayed canvas's
+   * background. The staging canvas tracks the video's intrinsic size so the
+   * encoder never up- or down-samples the frame; the CSS background then
+   * stretches it into the canvas content box exactly like drawImage would.
+   */
+  private paintCssFrame(id: string, data: LiveCanvasData) {
+    const { video, canvas } = data;
+    if (data.encoding || video.readyState < 2) return;
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (w === 0 || h === 0) return;
+    if (!data.staging) {
+      data.staging = document.createElement('canvas');
+      data.stagingCtx = data.staging.getContext('2d');
+    }
+    const { staging, stagingCtx } = data;
+    if (!stagingCtx) return;
+    if (staging.width !== w || staging.height !== h) {
+      staging.width = w;
+      staging.height = h;
+    }
+    stagingCtx.drawImage(video, 0, 0, w, h);
+    data.encoding = true;
+    staging.toBlob(
+      (blob) => {
+        // Stopped (or re-registered) while encoding: drop the frame.
+        if (!blob || this.canvasesData.get(id) !== data) {
+          data.encoding = false;
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        // Swapping background-image to a not-yet-decoded URL paints nothing
+        // until it lands, which at ~15fps reads as flicker. Decode it in this
+        // (same-origin) document first so the swap hits the image cache.
+        const commit = () => {
+          data.encoding = false;
+          if (this.canvasesData.get(id) !== data) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          paintCanvasCssFrame(canvas, url);
+          const previous = data.blobUrl;
+          data.blobUrl = url;
+          if (previous) URL.revokeObjectURL(previous);
+          this.paintedFrames += 1;
+          if (!this.tracedRendered.has(id)) {
+            this.tracedRendered.add(id);
+            canvasAgentTrace('FRAME_RENDERED', {
+              canvasId: id,
+              cssPaint: 1,
+              w,
+              h,
+            });
+          }
+        };
+        // Created in the canvas's own (player) document so the decoded
+        // resource is the one that document's style resolution will hit.
+        const img = (canvas.ownerDocument || document).createElement('img');
+        img.src = url;
+        if (typeof img.decode === 'function') {
+          img.decode().then(commit, commit);
+        } else {
+          commit();
+        }
+      },
+      CSS_FRAME_MIME,
+      CSS_FRAME_QUALITY,
+    );
   }
 
   draw = () => {
@@ -153,9 +324,31 @@ export default class CanvasReceiver {
         const { video, canvas, canvasCtx } = canvasData;
         const node = this.getNode(parseInt(id, 10));
         if (node) {
-          canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          if (video.paused) {
+            void video.play().catch(() => {});
+          }
+          if (this.useCssPaint) {
+            this.paintCssFrame(id, canvasData);
+          } else {
+            canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            if (video.videoWidth > 0) this.paintedFrames += 1;
+            if (!this.tracedRendered.has(id) && video.videoWidth > 0) {
+              this.tracedRendered.add(id);
+              canvasAgentTrace('FRAME_RENDERED', { canvasId: id, cssPaint: 0 });
+            }
+          }
+          publishAgentLive({
+            canvasId: id,
+            videoW: video.videoWidth,
+            videoH: video.videoHeight,
+            frames: this.paintedFrames,
+            ready: video.readyState,
+            overlay: false,
+            cssPaint: this.useCssPaint,
+            inDom: canvas.isConnected,
+          });
         } else {
-          this.canvasesData.delete(id);
+          this.disposeCanvasData(id);
         }
       });
     }
@@ -164,10 +357,111 @@ export default class CanvasReceiver {
   };
 }
 
+/** Debug-only window global consumed by the live-canvas QA harness. */
+function publishAgentLive(state: Record<string, unknown>): void {
+  try {
+    (window as Window & { __OR_AGENT_LIVE__?: Record<string, unknown> }).__OR_AGENT_LIVE__ =
+      state;
+  } catch {
+    /* ignore */
+  }
+}
+
+function resolvePaintTarget(node: { node: Node } | undefined): {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+} | null {
+  const el = node && (node.node as HTMLCanvasElement | undefined);
+  if (!el || (el as Element).tagName !== 'CANVAS') return null;
+  try {
+    const ctx = el.getContext('2d');
+    if (ctx) return { canvas: el, ctx };
+  } catch {
+    /* WebGL canvas — cannot paint 2d onto the same element */
+  }
+  return null;
+}
+
+function overlayLiveVideo(
+  videoEl: HTMLVideoElement | undefined,
+  canvasId: string,
+): () => void {
+  if (!videoEl || typeof document === 'undefined') return () => {};
+  const wrapId = 'or-live-canvas-wrap';
+  let wrap = document.getElementById(wrapId);
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.id = wrapId;
+    wrap.style.cssText =
+      'position:fixed;z-index:2147483646;overflow:hidden;pointer-events:auto;background:transparent;';
+    document.body.appendChild(wrap);
+  }
+  videoEl.id = `or-live-video-${canvasId}`;
+  videoEl.muted = true;
+  videoEl.autoplay = true;
+  videoEl.playsInline = true;
+  videoEl.setAttribute('autoplay', 'true');
+  videoEl.setAttribute('muted', 'true');
+  videoEl.setAttribute('playsinline', 'true');
+  videoEl.style.cssText =
+    'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:transparent;display:block;';
+  if (!wrap.contains(videoEl)) wrap.appendChild(videoEl);
+  const tryPlay = () => {
+    void videoEl.play().catch(() => {});
+  };
+  tryPlay();
+  wrap.addEventListener('click', tryPlay);
+  const place = () => {
+    const iframes = Array.from(document.querySelectorAll('iframe'));
+    iframes.sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight);
+    const target = iframes[0] || document.querySelector('[class*=player]');
+    if (!target) return;
+    const r = target.getBoundingClientRect();
+    wrap.style.left = `${r.left}px`;
+    wrap.style.top = `${r.top}px`;
+    wrap.style.width = `${r.width}px`;
+    wrap.style.height = `${r.height}px`;
+  };
+  place();
+  let frames = 0;
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    place();
+    tryPlay();
+    if (videoEl.videoWidth > 0) frames += 1;
+    publishAgentLive({
+      canvasId,
+      videoW: videoEl.videoWidth,
+      videoH: videoEl.videoHeight,
+      frames,
+      ready: videoEl.readyState,
+      overlay: true,
+      inDom: document.body.contains(videoEl),
+    });
+    requestAnimationFrame(tick);
+  };
+  tick();
+  return () => {
+    stopped = true;
+    wrap?.removeEventListener('click', tryPlay);
+    videoEl.srcObject = null;
+    videoEl.remove();
+    if (wrap && !wrap.querySelector('video')) wrap.remove();
+  };
+}
+
 function spawnVideo(stream: MediaStream, node: VElement) {
   const videoEl = document.createElement('video');
 
   videoEl.srcObject = stream;
+  // Set the IDL properties, not just content attributes: `muted` set via
+  // setAttribute after creation does not mute the element, and an unmuted
+  // video is blocked by autoplay policy until a user gesture — which is what
+  // used to surface as "Click to unpause canvas stream" on every connect.
+  videoEl.muted = true;
+  videoEl.autoplay = true;
+  videoEl.playsInline = true;
   videoEl.setAttribute('autoplay', 'true');
   videoEl.setAttribute('muted', 'true');
   videoEl.setAttribute('playsinline', 'true');
@@ -208,11 +502,27 @@ function spawnVideo(stream: MediaStream, node: VElement) {
   return videoEl;
 }
 
+function canvasAgentTrace(
+  stage: 'TRACK_RECEIVED' | 'FRAME_RECEIVED' | 'FRAME_RENDERED',
+  detail: Record<string, string | number>,
+): void {
+  try {
+    if (typeof window !== 'undefined' && (window as any).__OR_CANVAS_DEBUG__) {
+      // eslint-disable-next-line no-console
+      console.debug('[openreplay-canvas]', stage, detail);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 function checkId(id: string, cId: string): boolean {
   return id.includes(cId);
 }
 
 function getCanvasId(id: string): string {
+  const fromMarker = id.split('-canvas-')[1];
+  if (fromMarker) return fromMarker;
   return id.split('-')[4];
 }
 

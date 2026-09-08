@@ -18,7 +18,48 @@ import type { Options as ConfirmOptions } from "./ConfirmWindow/defaults.js";
 import ScreenRecordingState from "./ScreenRecordingState.js";
 import { pkgVersion } from "./version.js";
 import Canvas from "./Canvas.js";
+import { canvasLiveTrace } from "./canvasLiveDebug.js";
+
+// How long a freshly reported canvas id must stay unchanged before Assist
+// starts streaming it (see registerCanvas).
+const CANVAS_ID_SETTLE_MS = 300;
 import { gzip } from "fflate";
+
+const SS_CONFIRM_KEY = "__or_session_confirm";
+
+function iceCandidateInit(candidate: RTCIceCandidate): RTCIceCandidateInit {
+  try {
+    if (typeof candidate.toJSON === "function") {
+      return candidate.toJSON();
+    }
+  } catch {
+    /* fall through */
+  }
+  return {
+    candidate: candidate.candidate,
+    sdpMid: candidate.sdpMid,
+    sdpMLineIndex: candidate.sdpMLineIndex,
+    usernameFragment: candidate.usernameFragment,
+  };
+}
+
+function waitForIceGathering(pc: RTCPeerConnection, timeoutMs = 2500): Promise<void> {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") {
+      resolve();
+      return;
+    }
+    const done = () => {
+      pc.removeEventListener("icegatheringstatechange", onChange);
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === "complete") done();
+    };
+    pc.addEventListener("icegatheringstatechange", onChange);
+    window.setTimeout(done, timeoutMs);
+  });
+}
 
 type StartEndCallback = (agentInfo?: Record<string, any>) => (() => any) | void;
 
@@ -52,6 +93,8 @@ export interface Options {
   recordingConfirm: ConfirmOptions;
   /** Text/style customization for the session view confirmation popup. */
   sessionConfirm: ConfirmOptions;
+  /** When true, nothing is sent to Assist until the member approves. */
+  requestConfirm?: boolean;
   socketHost?: string;
 
   // @deprecated
@@ -90,6 +133,11 @@ export default class Assist {
   private calls: Map<string, RTCPeerConnection> = new Map();
   private canvasPeers: { [id: number]: RTCPeerConnection | null } = {};
   private canvasNodeCheckers: Map<number, any> = new Map();
+  // Element identity → node id of its live capture. The tracker can re-key a
+  // node (nodes.clear() on restart re-scan), and one <canvas> must never be
+  // captured twice (each WebGL proxy copies a full frame per rAF).
+  private canvasElements: Map<HTMLCanvasElement, number> = new Map();
+  private canvasSettleTimers: Map<number, number> = new Map();
   private assistDemandedRestart = false;
   private callingState: CallingState = CallingState.False;
   private remoteControl: RemoteControl | null = null;
@@ -352,6 +400,10 @@ export default class Assist {
       return callbacks;
     };
     this.assistDemandedRestart = true;
+    // app.stop() clears the node map, so every canvas gets a new id on
+    // start(). Drop the capture handlers keyed by the old ids (and their
+    // proxy copy loops) — the node callbacks re-register them after start.
+    this.resetCanvasHandlers();
     this.app.stop(false);
     this.app.clearBuffers();
     this.app.waitStatus(0).then(() => {
@@ -361,6 +413,9 @@ export default class Assist {
           .start()
           .then(() => {
             this.assistDemandedRestart = false;
+            // Shadow-root canvases (Flutter) are not guaranteed to hit
+            // attachNodeCallback during the re-walk; scan again.
+            this.rescanCanvases?.();
           })
           .then(() => {
             finish().forEach((cb) => {
@@ -642,7 +697,11 @@ export default class Assist {
 
     socket.on("NO_AGENT", () => {
       Object.values(this.agents).forEach((a) => a.onDisconnect?.());
-      this.cleanCanvasConnections();
+      // Last agent left: stop the live canvas capture loops too (the WebGL
+      // proxy copies a frame per rAF), not just the peer connections. The
+      // next NEW_AGENT re-discovers canvases via rescanCanvases().
+      this.resetCanvasHandlers();
+      canvasLiveTrace("CAPTURE_STOPPED", { reason: "no_agent" });
       this.agents = {};
       if (recordingState.isActive) recordingState.stopRecording();
       this.closeSessionConfirmWindow();
@@ -1043,48 +1102,221 @@ export default class Assist {
           });
           this.setupPeerListeners(uniqueId);
           this.applyBufferedIceCandidates(uniqueId);
+          canvasLiveTrace("PEER_CONNECTED", { canvasId: id });
 
           stream.getTracks().forEach((track) => {
             this.canvasPeers[uniqueId]?.addTrack(track, stream);
+            canvasLiveTrace("TRACK_SENT", {
+              canvasId: id,
+              kind: track.kind,
+              enabled: track.enabled,
+            });
           });
 
-          // Create SDP offer
-          const offer = await this.canvasPeers[uniqueId].createOffer();
-          await this.canvasPeers[uniqueId].setLocalDescription(offer);
-
-          // Send offer via signaling server
-          socket.emit("webrtc_canvas_offer", { offer, id: uniqueId });
+          // Create SDP offer and wait for host ICE so the agent can connect
+          // even if trickle candidates are dropped or delayed by signaling.
+          const pc = this.canvasPeers[uniqueId];
+          if (!pc) continue;
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          await waitForIceGathering(pc);
+          canvasLiveTrace("PEER_CONNECTION_STARTED", { canvasId: id, ice: pc.iceGatheringState });
+          socket.emit("webrtc_canvas_offer", {
+            offer: pc.localDescription,
+            id: uniqueId,
+          });
         }
       }
     };
 
-    app.nodes.attachNodeCallback((node) => {
+    const registerCanvas = (node: Node) => {
       const id = app.nodes.getID(node);
-      if (id && hasTag(node, "canvas") && !app.sanitizer.isHidden(id)) {
+      try {
+        const w = window as Window & {
+          __OR_CANVAS_LAST_SEEN__?: Record<string, unknown>;
+          __OR_CANVAS_LAST_ID__?: number;
+          __OR_CANVAS_MAP_SIZE__?: number;
+        };
+        w.__OR_CANVAS_LAST_SEEN__ = {
+          id: id ?? null,
+          tag: (node as Element).tagName || null,
+          hidden: id ? app.sanitizer.isHidden(id) : null,
+          mapped: id ? this.canvasMap.has(id) : false,
+        };
+        if (id) {
+          w.__OR_CANVAS_LAST_ID__ = id;
+          w.__OR_CANVAS_MAP_SIZE__ = this.canvasMap.size;
+        }
+      } catch {
+        /* ignore */
+      }
+      if (!id || !hasTag(node, "canvas") || app.sanitizer.isHidden(id)) {
+        return;
+      }
+      const el = node as HTMLCanvasElement;
+      if (el.id === "flutter-mirror-canvas" || el.id === "canvas-or-testing") {
+        return;
+      }
+      try {
+        const style = el.ownerDocument.defaultView?.getComputedStyle(el);
+        if (style && parseFloat(style.left) < -5000) {
+          return;
+        }
+      } catch {
+        /* ignore */
+      }
+      if (el.width < 2 || el.height < 2) {
+        return;
+      }
+      if (this.canvasMap.has(id) || this.canvasSettleTimers.has(id)) {
+        return;
+      }
+      // Capture only while someone is watching: a WebGL proxy copies a full
+      // frame per rAF, and NEW_AGENT restarts tracking and rescans canvases
+      // anyway. (__OR_CANVAS_DEBUG__ keeps eager capture for diagnostics.)
+      const debugEager = Boolean(
+        (window as Window & { __OR_CANVAS_DEBUG__?: boolean }).__OR_CANVAS_DEBUG__,
+      );
+      if (Object.keys(this.agents).length === 0 && !debugEager) {
+        canvasLiveTrace("CANVAS_DEFERRED", { canvasId: id });
+        return;
+      }
+      const startCapture = () => {
+        const prevId = this.canvasElements.get(el);
+        if (prevId !== undefined && prevId !== id) {
+          canvasLiveTrace("CANVAS_REKEYED", { from: prevId, to: id });
+          this.stopCanvasStream(prevId);
+        }
+        this.canvasElements.set(el, id);
+        canvasLiveTrace("CANVAS_DISCOVERED", { canvasId: id });
         app.debug.log(`Creating stream for canvas ${id}`);
         const canvasHandler = new Canvas(
           node as unknown as HTMLCanvasElement,
           id,
           30,
           (stream: MediaStream) => {
+            try {
+              const w = window as Window & { __OR_CANVAS_STREAMS__?: unknown[] };
+              w.__OR_CANVAS_STREAMS__ = w.__OR_CANVAS_STREAMS__ || [];
+              w.__OR_CANVAS_STREAMS__.push({
+                id,
+                w: el.width,
+                h: el.height,
+                tracks: stream.getTracks().length,
+                source: canvasHandler.captureSource,
+                context: canvasHandler.captureContext,
+              });
+            } catch {
+              /* ignore */
+            }
             startCanvasStream(stream, id);
           },
           app.debug.error,
         );
         this.canvasMap.set(id, canvasHandler);
+        try {
+          (window as Window & { __OR_CANVAS_MAP_SIZE__?: number }).__OR_CANVAS_MAP_SIZE__ =
+            this.canvasMap.size;
+        } catch {
+          /* ignore */
+        }
         if (this.canvasNodeCheckers.has(id)) {
           clearInterval(this.canvasNodeCheckers.get(id));
         }
         const int = setInterval(() => {
           const isPresent = node.ownerDocument.defaultView && node.isConnected;
-          if (!isPresent) {
+          const rekeyed = app.nodes.getID(node) !== id;
+          if (!isPresent || rekeyed) {
             this.stopCanvasStream(id);
             clearInterval(int);
           }
         }, 5000);
         this.canvasNodeCheckers.set(id, int);
+      };
+      // Node ids are only stable once the observer has bound the tree. A
+      // callback that fires before that (consumer pre-registration, the
+      // restart re-scan) carries an id the observer is about to reassign;
+      // streaming it would offer the agent a canvas it can never map. Let
+      // the id settle and re-check before capturing.
+      const settle = window.setTimeout(() => {
+        this.canvasSettleTimers.delete(id);
+        if (!el.isConnected || app.nodes.getID(el) !== id || this.canvasMap.has(id)) {
+          canvasLiveTrace("CANVAS_ID_UNSETTLED", {
+            canvasId: id,
+            now: app.nodes.getID(el) ?? null,
+          });
+          return;
+        }
+        startCapture();
+      }, CANVAS_ID_SETTLE_MS);
+      this.canvasSettleTimers.set(id, settle);
+    };
+
+    // Flutter CanvasKit (and similar) paints into a <canvas> inside an open
+    // shadow root. The tracker binds shadow trees itself (top_observer node
+    // callback), but scanTree() does not descend into them and the bind can
+    // land after our scan, so poll the known framework hosts for a while.
+    const FRAMEWORK_CANVAS_HOSTS = ["flt-glass-pane", "flt-renderer", "flutter-view"];
+    let frameworkScanAttempts = 0;
+    const discoverFrameworkCanvases = () => {
+      if (typeof document === "undefined") return;
+      let hostCount = 0;
+      let found = 0;
+      FRAMEWORK_CANVAS_HOSTS.forEach((sel) => {
+        document.querySelectorAll(sel).forEach((host) => {
+          hostCount += 1;
+          const root: ParentNode = (host as Element).shadowRoot ?? host;
+          root.querySelectorAll("canvas").forEach((canvas) => {
+            // Never assign ids here: the observer owns node ids and clears
+            // them on (re)start, which would leave a stale capture behind.
+            // Only pick up canvases the tracker has already bound; the retry
+            // below covers the window until it binds the shadow tree.
+            if (app.nodes.getID(canvas) === undefined) return;
+            registerCanvas(canvas);
+            found += 1;
+          });
+        });
+      });
+      if (found === 0 && hostCount > 0 && frameworkScanAttempts < 20) {
+        frameworkScanAttempts += 1;
+        setTimeout(discoverFrameworkCanvases, 500);
+      }
+    };
+
+    app.nodes.attachNodeCallback(registerCanvas);
+    // Canvases already in the node map (Shadow DOM / late plugin attach)
+    // never fire attachNodeCallback. Replay already scanTree()s them.
+    this.rescanCanvases = () => {
+      frameworkScanAttempts = 0;
+      app.nodes.scanTree(registerCanvas);
+      discoverFrameworkCanvases();
+    };
+    this.rescanCanvases();
+  }
+
+  private rescanCanvases: (() => void) | null = null;
+
+  /** Stop every live canvas capture and forget the (about to be stale) ids. */
+  private resetCanvasHandlers() {
+    this.canvasMap.forEach((handler) => {
+      try {
+        handler.stop();
+      } catch {
+        /* ignore */
       }
     });
+    this.canvasMap.clear();
+    this.canvasNodeCheckers.forEach((int) => clearInterval(int));
+    this.canvasNodeCheckers.clear();
+    this.canvasElements.clear();
+    this.canvasSettleTimers.forEach((t) => clearTimeout(t));
+    this.canvasSettleTimers.clear();
+    this.cleanCanvasConnections();
+    try {
+      (window as Window & { __OR_CANVAS_MAP_SIZE__?: number }).__OR_CANVAS_MAP_SIZE__ = 0;
+    } catch {
+      /* ignore */
+    }
   }
 
   private setupPeerListeners(id: string) {
@@ -1094,7 +1326,7 @@ export default class Assist {
     peer.onicecandidate = (event) => {
       if (event.candidate && this.socket) {
         this.socket.emit("webrtc_canvas_ice_candidate", {
-          candidate: event.candidate,
+          candidate: iceCandidateInit(event.candidate),
           id,
         });
       }
@@ -1142,22 +1374,29 @@ export default class Assist {
 
   private stopCanvasStream(id: number) {
     for (const agent of Object.values(this.agents)) {
-      if (!agent.agentInfo) return;
-
+      if (!agent.agentInfo) continue;
       const uniqueId = `${agent.agentInfo.peerId}-${agent.agentInfo.id}-canvas-${id}`;
       this.socket?.emit("webrtc_canvas_stop", { id: uniqueId });
-
       if (this.canvasPeers[uniqueId]) {
         this.canvasPeers[uniqueId]?.close();
         delete this.canvasPeers[uniqueId];
-
-        this.canvasMap.get(id)?.stop();
-        this.canvasMap.delete(id);
-        this.canvasNodeCheckers.get(id) &&
-          clearInterval(this.canvasNodeCheckers.get(id));
-        this.canvasNodeCheckers.delete(id);
       }
     }
+    // Stop the capture itself even when no peer was ever created for it
+    // (stale id after a tracker re-key, agent not yet connected, ...).
+    this.canvasMap.get(id)?.stop();
+    this.canvasMap.delete(id);
+    this.canvasNodeCheckers.get(id) && clearInterval(this.canvasNodeCheckers.get(id));
+    this.canvasNodeCheckers.delete(id);
+    const settle = this.canvasSettleTimers.get(id);
+    if (settle !== undefined) {
+      clearTimeout(settle);
+      this.canvasSettleTimers.delete(id);
+    }
+    this.canvasElements.forEach((v, el) => {
+      if (v === id) this.canvasElements.delete(el);
+    });
+    canvasLiveTrace("CAPTURE_STOPPED", { canvasId: id });
   }
 
   private applyBufferedIceCandidates(from) {

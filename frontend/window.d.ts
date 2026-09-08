@@ -13,6 +13,7 @@ declare global {
       SOURCEMAP: boolean;
       CRISP_KEY: string;
       CAPTCHA_ENABLED: string;
+      ICE_SERVERS?: string;
     };
   }
 }

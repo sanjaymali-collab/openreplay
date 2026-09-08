@@ -378,6 +378,9 @@ export default class AssistManager {
         id: agentId,
       },
       socket,
+      // Same rule as TabManager -> CanvasManager: the sandboxed player
+      // document cannot show a canvas bitmap, so paint live frames via CSS.
+      !this.screen.scriptingEnabled,
     );
 
     document.addEventListener('visibilitychange', this.onVisChange);
@@ -386,6 +389,14 @@ export default class AssistManager {
   private getIceServers = () => {
     if (this.config) {
       return this.config;
+    }
+    // Community Edition has no /assist/credentials endpoint, so allow a
+    // deployment-level ICE/TURN config via the ICE_SERVERS build env
+    // (JSON array of RTCIceServer). Needed whenever agent and member cannot
+    // reach each other over host/STUN candidates (symmetric NAT, no hairpin).
+    const fromEnv = parseIceServersEnv();
+    if (fromEnv) {
+      return fromEnv;
     }
     return [
       {
@@ -464,5 +475,31 @@ export default class AssistManager {
     this.clearInactiveTimeout();
     this.socketCloseTimeout && clearTimeout(this.socketCloseTimeout);
     document.removeEventListener('visibilitychange', this.onVisChange);
+  }
+}
+
+/**
+ * Parse the optional ICE_SERVERS build env (JSON array of RTCIceServer).
+ * Returns null when unset or malformed so callers fall back to defaults.
+ */
+export function parseIceServersEnv(
+  raw: unknown = typeof window !== 'undefined'
+    ? (window.env as { ICE_SERVERS?: string } | undefined)?.ICE_SERVERS
+    : undefined,
+): RTCIceServer[] | null {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    const valid = parsed.every(
+      (s) =>
+        s &&
+        typeof s === 'object' &&
+        (typeof s.urls === 'string' ||
+          (Array.isArray(s.urls) && s.urls.every((u: unknown) => typeof u === 'string'))),
+    );
+    return valid ? (parsed as RTCIceServer[]) : null;
+  } catch {
+    return null;
   }
 }

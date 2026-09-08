@@ -8,8 +8,10 @@
     "moduleResolution": "Node",
     "allowSyntheticDefaultImports": true,
     "declaration": true,
+    "skipLibCheck": true,
     "outDir": "./lib",
     "rootDir": "src"
   },
-  "exclude": ["**/*.test.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["lib", "cjs", "tests", "**/*.test.ts", "node_modules"]
 }

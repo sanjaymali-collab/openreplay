@@ -151,7 +151,7 @@ export default class RemoteControl {
   // a browser-native popup), so the agent opens it on the mirrored DOM and we
   // receive the chosen value here to apply on the real element.
   select = (id: string, value: string) => {
-    if (!this.isAuthorized(id) || !this.focused) return
+    if (id !== this.agentID || !this.focused) return
     if (this.focused instanceof HTMLSelectElement) {
       this.focused.value = value
       this.focused.dispatchEvent(new Event('input', { bubbles: true }))

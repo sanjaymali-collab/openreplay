@@ -78,8 +78,12 @@ export default class CanvasReceiver {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        const candidate =
+          typeof event.candidate.toJSON === 'function'
+            ? event.candidate.toJSON()
+            : event.candidate;
         this.socket.emit('webrtc_canvas_ice_candidate', {
-          candidate: event.candidate,
+          candidate,
           id,
         });
       }
@@ -91,23 +95,29 @@ export default class CanvasReceiver {
         // Detect canvasId from remote peer id
         const canvasId = getCanvasId(id);
         this.streams.set(canvasId, stream);
+        canvasAgentTrace('TRACK_RECEIVED', {
+          canvasId,
+          tracks: stream.getTracks().length,
+        });
         setTimeout(() => {
           const node = this.getNode(parseInt(canvasId, 10));
           const videoEl = spawnVideo(
-            stream.clone() as MediaStream,
+            stream,
             node as VElement,
           );
-          if (node && videoEl) {
+          const target = resolvePaintTarget(node);
+          if (target && videoEl) {
             this.canvasesData.set(canvasId, {
               video: videoEl,
-              canvas: node.node as HTMLCanvasElement,
-              canvasCtx: (node.node as HTMLCanvasElement)?.getContext(
-                '2d',
-              ) as CanvasRenderingContext2D,
+              canvas: target.canvas,
+              canvasCtx: target.ctx,
             });
+            canvasAgentTrace('FRAME_RECEIVED', { canvasId });
             this.draw();
           } else {
-            logger.log('NODE', canvasId, 'IS NOT FOUND');
+            logger.log('NODE', canvasId, 'IS NOT FOUND — overlaying live canvas video');
+            overlayLiveVideo(videoEl, canvasId);
+            canvasAgentTrace('FRAME_RECEIVED', { canvasId, overlay: 1 });
           }
         }, 250);
       }
@@ -117,8 +127,23 @@ export default class CanvasReceiver {
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    await new Promise<void>((resolve) => {
+      if (pc.iceGatheringState === 'complete') {
+        resolve();
+        return;
+      }
+      const done = () => {
+        pc.removeEventListener('icegatheringstatechange', onChange);
+        resolve();
+      };
+      const onChange = () => {
+        if (pc.iceGatheringState === 'complete') done();
+      };
+      pc.addEventListener('icegatheringstatechange', onChange);
+      window.setTimeout(done, 2500);
+    });
 
-    this.socket.emit('webrtc_canvas_answer', { answer, id });
+    this.socket.emit('webrtc_canvas_answer', { answer: pc.localDescription, id });
   }
 
   async handleCandidate(
@@ -154,6 +179,9 @@ export default class CanvasReceiver {
         const node = this.getNode(parseInt(id, 10));
         if (node) {
           canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          if (this.frameCounter === 4) {
+            canvasAgentTrace('FRAME_RENDERED', { canvasId: id });
+          }
         } else {
           this.canvasesData.delete(id);
         }
@@ -162,6 +190,35 @@ export default class CanvasReceiver {
     this.frameCounter++;
     requestAnimationFrame(() => this.draw());
   };
+}
+
+function resolvePaintTarget(node: { node: Node } | undefined): {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+} | null {
+  const el = node && (node.node as HTMLCanvasElement | undefined);
+  if (!el || (el as Element).tagName !== 'CANVAS') return null;
+  try {
+    const ctx = el.getContext('2d');
+    if (ctx) return { canvas: el, ctx };
+  } catch {
+    /* WebGL canvas — cannot paint 2d onto the same element */
+  }
+  return null;
+}
+
+function overlayLiveVideo(videoEl: HTMLVideoElement | undefined, canvasId: string) {
+  if (!videoEl || typeof document === 'undefined') return;
+  const existing = document.getElementById(`or-live-canvas-${canvasId}`);
+  if (existing) existing.remove();
+  videoEl.id = `or-live-canvas-${canvasId}`;
+  videoEl.style.cssText =
+    'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#111;z-index:20;pointer-events:none;';
+  const host =
+    document.querySelector('[class*="player"] iframe')?.parentElement ||
+    document.querySelector('[data-openreplay-player]') ||
+    document.body;
+  host.appendChild(videoEl);
 }
 
 function spawnVideo(stream: MediaStream, node: VElement) {
@@ -204,11 +261,27 @@ function spawnVideo(stream: MediaStream, node: VElement) {
   return videoEl;
 }
 
+function canvasAgentTrace(
+  stage: 'TRACK_RECEIVED' | 'FRAME_RECEIVED' | 'FRAME_RENDERED',
+  detail: Record<string, string | number>,
+): void {
+  try {
+    if (typeof window !== 'undefined' && (window as any).__OR_CANVAS_DEBUG__) {
+      // eslint-disable-next-line no-console
+      console.debug('[openreplay-canvas]', stage, detail);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 function checkId(id: string, cId: string): boolean {
   return id.includes(cId);
 }
 
 function getCanvasId(id: string): string {
+  const fromMarker = id.split('-canvas-')[1];
+  if (fromMarker) return fromMarker;
   return id.split('-')[4];
 }
 
