@@ -17,7 +17,7 @@ import {
 import type { Options as ConfirmOptions } from "./ConfirmWindow/defaults.js";
 import ScreenRecordingState from "./ScreenRecordingState.js";
 import { pkgVersion } from "./version.js";
-import Canvas from "./Canvas.js";
+import Canvas, { configureCanvasSender } from "./Canvas.js";
 import { canvasLiveTrace, isCanvasLiveDebug } from "./canvasLiveDebug.js";
 import { findShadowRootCanvases } from "./canvasDiscovery.js";
 import { gzip } from "fflate";
@@ -31,6 +31,8 @@ const SHADOW_SCAN_INTERVAL_MS = 500;
 const SHADOW_SCAN_MAX_ATTEMPTS = 20;
 
 const SS_CONFIRM_KEY = "__or_session_confirm";
+/** Fresh offers attempted per canvas peer after ICE reports `failed`. */
+const CANVAS_PEER_MAX_RETRIES = 2;
 
 function iceCandidateInit(candidate: RTCIceCandidate): RTCIceCandidateInit {
   try {
@@ -154,6 +156,8 @@ export default class Assist {
   private readonly options: Options;
   private readonly canvasMap: Map<number, Canvas> = new Map();
   private iceCandidatesBuffer: Map<string, RTCIceCandidateInit[]> = new Map();
+  /** Re-offer attempts per canvas peer id after an ICE `failed` (see startCanvasStream). */
+  private canvasPeerRetries: Map<string, number> = new Map();
   private tabBus: BroadcastChannel | null = null;
   private tabState = {
     rcActive: undefined,
@@ -1121,18 +1125,45 @@ export default class Assist {
           this.canvasPeers[uniqueId] = new RTCPeerConnection({
             iceServers: this.config,
           });
-          this.setupPeerListeners(uniqueId);
+          this.setupPeerListeners(uniqueId, () => {
+            // ICE gave up (candidates dropped in signaling, TURN allocation
+            // lost, network flip). One fresh offer per failure, bounded, so a
+            // transient failure does not leave the agent on a blank canvas.
+            const attempts = (this.canvasPeerRetries.get(uniqueId) || 0) + 1;
+            this.canvasPeerRetries.set(uniqueId, attempts);
+            this.canvasPeers[uniqueId]?.close();
+            delete this.canvasPeers[uniqueId];
+            if (attempts > CANVAS_PEER_MAX_RETRIES) {
+              canvasLiveTrace("PEER_FAILED", { canvasId: id, attempts });
+              return;
+            }
+            canvasLiveTrace("PEER_RETRY", { canvasId: id, attempts });
+            const live = this.canvasMap.get(id)?.stream;
+            if (live) void startCanvasStream(live, id);
+          });
           this.applyBufferedIceCandidates(uniqueId);
           canvasLiveTrace("PEER_CONNECTED", { canvasId: id });
 
-          stream.getTracks().forEach((track) => {
-            this.canvasPeers[uniqueId]?.addTrack(track, stream);
+          const sourceEl = this.canvasMap.get(id)?.source;
+          for (const track of stream.getTracks()) {
+            const sender = this.canvasPeers[uniqueId]?.addTrack(track, stream);
             canvasLiveTrace("TRACK_SENT", {
               canvasId: id,
               kind: track.kind,
               enabled: track.enabled,
+              contentHint: (track as MediaStreamTrack & { contentHint?: string }).contentHint || "",
             });
-          });
+            if (sender && track.kind === "video") {
+              // Encoding policy must be set before the offer so the first
+              // negotiated stream already carries it (see Canvas.ts).
+              const settings = track.getSettings();
+              await configureCanvasSender(
+                sender,
+                settings.width || sourceEl?.width || 0,
+                settings.height || sourceEl?.height || 0,
+              );
+            }
+          }
 
           // Create SDP offer and wait for host ICE so the agent can connect
           // even if trickle candidates are dropped or delayed by signaling.
@@ -1202,6 +1233,17 @@ export default class Assist {
             startCanvasStream(stream, id);
           },
           app.debug.error,
+          (width: number, height: number) => {
+            // Frame size changed: re-derive each peer's bitrate ceiling so a
+            // window grown after connect is not encoded under the old cap.
+            for (const [agentSocketId, agent] of Object.entries(this.agents)) {
+              if (!agent.agentInfo) continue;
+              const pc = this.canvasPeers[this.canvasPeerId(agentSocketId, agent.agentInfo, id)];
+              pc?.getSenders().forEach((sender) => {
+                if (sender.track?.kind === "video") void configureCanvasSender(sender, width, height);
+              });
+            }
+          },
         );
         this.canvasMap.set(id, canvasHandler);
         if (this.canvasNodeCheckers.has(id)) {
@@ -1297,7 +1339,7 @@ export default class Assist {
     this.cleanCanvasConnections();
   }
 
-  private setupPeerListeners(id: string) {
+  private setupPeerListeners(id: string, onFailed?: () => void) {
     const peer = this.canvasPeers[id];
     if (!peer) return;
     // ICE candidates
@@ -1307,6 +1349,16 @@ export default class Assist {
           candidate: iceCandidateInit(event.candidate),
           id,
         });
+      }
+    };
+    peer.onconnectionstatechange = () => {
+      // Only act on the connection still registered under this id: a
+      // superseded/closed peer must not trigger a retry of its replacement.
+      if (this.canvasPeers[id] !== peer) return;
+      if (peer.connectionState === "connected") {
+        this.canvasPeerRetries.delete(id);
+      } else if (peer.connectionState === "failed") {
+        onFailed?.();
       }
     };
   }
@@ -1347,6 +1399,7 @@ export default class Assist {
   private cleanCanvasConnections() {
     Object.values(this.canvasPeers).forEach((pc) => pc?.close());
     this.canvasPeers = {};
+    this.canvasPeerRetries.clear();
     this.socket?.emit("webrtc_canvas_restart");
   }
 
@@ -1372,6 +1425,7 @@ export default class Assist {
         this.canvasPeers[uniqueId]?.close();
         delete this.canvasPeers[uniqueId];
       }
+      this.canvasPeerRetries.delete(uniqueId);
     }
     // Stop the capture itself even when no peer was ever created for it
     // (stale id after a tracker re-key, agent not yet connected, ...).

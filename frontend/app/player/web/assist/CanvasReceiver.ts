@@ -112,6 +112,14 @@ export default class CanvasReceiver {
     offer: RTCSessionDescriptionInit,
     id: string,
   ): Promise<void> {
+    // A fresh offer for an id we already hold is the member re-offering after
+    // an ICE failure: release the dead connection instead of leaking it.
+    const stale = this.connections.get(id);
+    if (stale) {
+      stale.close();
+      this.connections.delete(id);
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: this.config,
     });

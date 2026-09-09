@@ -15,6 +15,8 @@ export type CanvasLiveStage =
   | 'STREAM_CREATED'
   | 'TRACK_CREATED'
   | 'PEER_CONNECTED'
+  | 'PEER_RETRY'
+  | 'PEER_FAILED'
   | 'TRACK_SENT'
   | 'FRAME_PRODUCED'
   | 'TRACKER_RESTART'
