@@ -190,6 +190,12 @@ export default class AssistManager {
     const urlObject = new URL(ENV.API_EDP || window.location.origin);
     // does it handle ssl automatically?
 
+    const agentInfo = {
+      ...this.session.agentInfo,
+      id: agentId,
+      peerId: this.peerID,
+      query: document.location.search,
+    };
     const socket: Socket = (this.socket = io(urlObject.origin, {
       withCredentials: true,
       multiplex: true,
@@ -205,12 +211,7 @@ export default class AssistManager {
         peerId: this.peerID,
         projectId,
         identity: 'agent',
-        agentInfo: JSON.stringify({
-          ...this.session.agentInfo,
-          id: agentId,
-          peerId: this.peerID,
-          query: document.location.search,
-        }),
+        agentInfo: JSON.stringify(agentInfo),
         config: JSON.stringify(this.getIceServers()),
       },
     }));
@@ -275,6 +276,12 @@ export default class AssistManager {
       waitingForMessages = true;
       this.store.update({ currentTab: undefined });
       this.setStatus(ConnectionStatus.Connected);
+      // The member's tracker just (re)joined the room — page reload in the
+      // same tab, or a tracker stop()/start(). The stock assist server only
+      // gives it our bare socket id (AGENTS_CONNECTED), which is not enough to
+      // open a canvas peer, so re-announce ourselves; the tracker treats this
+      // like NEW_AGENT (and ignores it if it already knows this socket).
+      socket.emit('agent_announce', { agentInfo });
     });
 
     socket.on('UPDATE_SESSION', (evData) => {

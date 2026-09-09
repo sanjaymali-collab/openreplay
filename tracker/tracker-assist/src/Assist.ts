@@ -650,7 +650,7 @@ export default class Assist {
       }
     });
 
-    socket.on("NEW_AGENT", (id: string, info: AgentInfo) => {
+    const onNewAgent = (id: string, info: AgentInfo) => {
       this.cleanCanvasConnections();
       this.agents[id] = {
         onDisconnect: this.options.onAgentConnect?.(info),
@@ -663,6 +663,22 @@ export default class Assist {
         return;
       }
       this.restartTracking(() => this.remoteControl?.reconnect([id]));
+    };
+    socket.on("NEW_AGENT", onNewAgent);
+
+    // The member (re)joined a room where an agent is already present — page
+    // reload in the same tab, or a tracker stop()/start() (view eligibility
+    // flip) while the agent kept the Assist page open. The stock assist
+    // server only tells us `AGENTS_CONNECTED` (bare socket ids, no AgentInfo)
+    // in that case, which is not enough to open a canvas peer, so the agent
+    // re-announces itself on `SESSION_RECONNECTED` and we treat that exactly
+    // like NEW_AGENT. Servers that also send AGENTS_INFO_CONNECTED will have
+    // registered the agent already — then this is a no-op.
+    socket.on("agent_announce", (id: string, data: { agentInfo?: AgentInfo }) => {
+      const info = data?.agentInfo;
+      if (!id || !info) return;
+      if (this.agents[id]) return;
+      onNewAgent(id, info);
     });
 
     socket.on("AGENTS_INFO_CONNECTED", (agentsInfo: AgentInfo[]) => {
@@ -1096,10 +1112,10 @@ export default class Assist {
       // canvas streams go over WebRTC, not this.emit — gate them explicitly;
       // the restart on approval re-triggers the node callbacks
       if (!this.canSendMessages) return;
-      for (const agent of Object.values(this.agents)) {
+      for (const [agentSocketId, agent] of Object.entries(this.agents)) {
         if (!agent.agentInfo) return;
 
-        const uniqueId = `${agent.agentInfo.peerId}-${agent.agentInfo.id}-canvas-${id}`;
+        const uniqueId = this.canvasPeerId(agentSocketId, agent.agentInfo, id);
 
         if (!this.canvasPeers[uniqueId]) {
           this.canvasPeers[uniqueId] = new RTCPeerConnection({
@@ -1334,10 +1350,23 @@ export default class Assist {
     this.socket?.emit("webrtc_canvas_restart");
   }
 
+  /**
+   * Peer id for one canvas stream to ONE agent socket. It must include the
+   * agent's socket id: `peerId` + `agentInfo.id` alone are identical for every
+   * Assist tab (or stale socket) of the same agent user, so a second tab would
+   * share the same offer, both tabs would answer it, and whichever answer
+   * landed first won — leaving the tab the agent is actually looking at stuck
+   * in `connecting` with a blank canvas. CanvasReceiver filters offers on the
+   * same `<peer>-<agent>-<socket>-canvas` prefix.
+   */
+  private canvasPeerId(agentSocketId: string, agentInfo: AgentInfo, canvasId: number) {
+    return `${agentInfo.peerId}-${agentInfo.id}-${agentSocketId}-canvas-${canvasId}`;
+  }
+
   private stopCanvasStream(id: number) {
-    for (const agent of Object.values(this.agents)) {
+    for (const [agentSocketId, agent] of Object.entries(this.agents)) {
       if (!agent.agentInfo) continue;
-      const uniqueId = `${agent.agentInfo.peerId}-${agent.agentInfo.id}-canvas-${id}`;
+      const uniqueId = this.canvasPeerId(agentSocketId, agent.agentInfo, id);
       this.socket?.emit("webrtc_canvas_stop", { id: uniqueId });
       if (this.canvasPeers[uniqueId]) {
         this.canvasPeers[uniqueId]?.close();

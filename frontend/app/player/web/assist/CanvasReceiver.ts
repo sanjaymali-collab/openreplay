@@ -40,7 +40,17 @@ export default class CanvasReceiver {
   // Store RTCPeerConnection for each remote peer
   private connections: Map<string, RTCPeerConnection> = new Map();
 
-  private cId: string;
+  /**
+   * Prefix of the canvas peer ids addressed to THIS agent socket:
+   * `<peerId>-<agentId>-<socketId>-canvas`. The socket id is part of it on
+   * purpose — `peerId` + `agentId` are the same for every Assist tab of the
+   * same agent user, so without it a second (or stale) tab would answer the
+   * offers meant for this one and hijack the negotiation. Read lazily: the
+   * socket id only exists after connect and changes on reconnect.
+   */
+  private get cId(): string {
+    return `${this.peerIdPrefix}-${this.agentInfo.id}-${this.socket.id}-canvas`;
+  }
 
   private frameCounter = 0;
 
@@ -64,9 +74,6 @@ export default class CanvasReceiver {
      */
     private readonly useCssPaint: boolean = false,
   ) {
-    // Form an id like in PeerJS
-    this.cId = `${this.peerIdPrefix}-${this.agentInfo.id}-canvas`;
-
     this.socket.on(
       'webrtc_canvas_offer',
       (data: { data: { offer: RTCSessionDescriptionInit; id: string } }) => {
