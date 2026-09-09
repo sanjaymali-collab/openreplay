@@ -1,5 +1,6 @@
 import { isIFrameElement, isRootNode } from 'App/player/guards';
 import { insertRule, deleteRule, replaceRule } from './safeCSSRules';
+import { restoreCanvasCssFrame } from '../canvasCssPaint';
 
 function isNode(sth: any): sth is Node {
   return !!sth && sth.nodeType != null;
@@ -231,7 +232,11 @@ export class VElement extends VParent<Element> {
 
   private applyAttributeChanges() {
     // "changes" -> "updates" ?
+    let styleRewritten = false;
     this.newAttributes.forEach((value, key) => {
+      if (key === 'style') {
+        styleRewritten = true;
+      }
       if (value === false) {
         this.node.removeAttribute(key);
       } else {
@@ -243,6 +248,11 @@ export class VElement extends VParent<Element> {
       }
     });
     this.newAttributes.clear();
+    // Canvas frames (replay + live Assist) are painted into the inline style;
+    // a recorded `style` mutation just replaced that attribute wholesale.
+    if (styleRewritten) {
+      restoreCanvasCssFrame(this.node);
+    }
   }
 
   applyChanges() {
