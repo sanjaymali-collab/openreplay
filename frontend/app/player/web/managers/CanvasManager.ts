@@ -3,7 +3,7 @@ import parseFrames, { FrameSnapshot } from 'Player/common/parseFrames';
 import unpackTar from 'Player/common/tarball';
 import unpack from 'Player/common/unpack';
 import { VElement } from 'Player/web/managers/DOM/VirtualDOM';
-import { paintCanvasCssFrame } from 'Player/web/managers/canvasCssPaint';
+import { paintCanvasCssFrameDecoded } from 'Player/web/managers/canvasCssPaint';
 import { TarFile } from 'js-untar';
 
 const playMode = {
@@ -29,6 +29,16 @@ export default class CanvasManager extends ListWalker<Timestamp> {
   private playMode: string = playMode.snaps;
 
   private snapshots: Record<number, TarFile | FrameSnapshot> = {};
+
+  /**
+   * Whether the blob URLs handed out by `snapshots` are ours to revoke.
+   * FrameSnapshot mints a fresh URL per getBlobUrl() call, so the displaced
+   * one can be released. js-untar's TarFile caches its URL and returns the
+   * same string every time — revoking it leaves every later visit to that
+   * frame (seek back, replay again) pointing at a dead URL, i.e. a blank
+   * canvas. Tar-backed URLs are left to the TarFile that owns them.
+   */
+  private ownsSnapshotUrls = true;
 
   private debugCanvas: HTMLCanvasElement | undefined;
 
@@ -97,6 +107,7 @@ export default class CanvasManager extends ListWalker<Timestamp> {
   }
 
   public mapToSnapshots(files: TarFile[]) {
+    this.ownsSnapshotUrls = false;
     const tempArr: Timestamp[] = [];
     const filenameRegexp = /(\d+)_(\d+)_(\d+)\.(jpeg|png|avif|webp)$/;
     const firstPair = files[0].name.match(filenameRegexp);
@@ -292,6 +303,11 @@ export default class CanvasManager extends ListWalker<Timestamp> {
    *
    * This and the bitmap path are mutually exclusive — only one of them can ever
    * be visible, and doing both would decode every frame twice.
+   *
+   * The frame is decoded before the swap (paintCanvasCssFrameDecoded): a
+   * background-image pointed at a not-yet-loaded URL renders nothing until it
+   * lands, which at the ~1fps canvas snapshot rate shows as a white flash on
+   * every frame. The previous frame stays up until the new one is ready.
    */
   private paintFrame = (blobUrl: string) => {
     const canvasEl = this.getNode(parseInt(this.nodeId, 10))?.node as
@@ -306,7 +322,7 @@ export default class CanvasManager extends ListWalker<Timestamp> {
       }
       return;
     }
-    paintCanvasCssFrame(canvasEl, blobUrl);
+    paintCanvasCssFrameDecoded(canvasEl, blobUrl);
   };
 
   /** Take ownership of the displayed frame and release the one it replaced. */
@@ -332,7 +348,9 @@ export default class CanvasManager extends ListWalker<Timestamp> {
         if (!this.useCssPaint || this.debugCanvas) {
           this.snapImage.src = blobUrl;
         }
-        this.retainFrame(blobUrl);
+        if (this.ownsSnapshotUrls) {
+          this.retainFrame(blobUrl);
+        }
       }
     }
   };

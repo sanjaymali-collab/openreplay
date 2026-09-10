@@ -44,9 +44,46 @@ export function paintCanvasCssFrame(
   applyFrameStyle(canvasEl, blobUrl);
 }
 
+/**
+ * Frame each canvas is currently decoding. Only the most recent request may
+ * commit, so a burst of frames (seek, fast-forward) never paints out of order.
+ */
+const pendingFrames = new WeakMap<Element, string>();
+
+/**
+ * Like paintCanvasCssFrame, but decode the image before swapping it in.
+ *
+ * Swapping `background-image` straight to a not-yet-loaded blob URL paints the
+ * canvas with no background at all until the image lands — for a ~1fps canvas
+ * stream that is a white flash on every frame. Decoding through an <img>
+ * created in the canvas's own document first means the swap hits the image
+ * cache and the previous frame stays on screen until the new one is ready.
+ * Falls back to an immediate swap when decode() is unavailable or fails.
+ */
+export function paintCanvasCssFrameDecoded(
+  canvasEl: HTMLCanvasElement,
+  blobUrl: string,
+): void {
+  pendingFrames.set(canvasEl, blobUrl);
+  const commit = () => {
+    // Superseded by a newer frame while decoding: drop this one.
+    if (pendingFrames.get(canvasEl) !== blobUrl) return;
+    pendingFrames.delete(canvasEl);
+    paintCanvasCssFrame(canvasEl, blobUrl);
+  };
+  const img = (canvasEl.ownerDocument || document).createElement('img');
+  img.src = blobUrl;
+  if (typeof img.decode === 'function') {
+    img.decode().then(commit, commit);
+  } else {
+    commit();
+  }
+}
+
 /** Remove a previously painted CSS frame so a stale image never lingers. */
 export function clearCanvasCssFrame(canvasEl: HTMLCanvasElement): void {
   paintedFrames.delete(canvasEl);
+  pendingFrames.delete(canvasEl);
   Object.assign(canvasEl.style, {
     backgroundImage: '',
     backgroundSize: '',
